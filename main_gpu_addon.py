@@ -1016,6 +1016,13 @@ def image_generation_process(
 
         # Initialize Stream Diffusion - wrapper handles all optimizations internally
         _status("Initializing StreamDiffusion...")
+        model_root = os.path.dirname(os.path.normpath(model_path_dir))
+        model_name = os.path.basename(os.path.normpath(model_path_dir))
+        trt_engine_dir = os.path.join(model_root, f"{model_name}-trt")
+        if acceleration == "tensorrt":
+            os.makedirs(trt_engine_dir, exist_ok=True)
+            _status(f"TensorRT engines dir: {trt_engine_dir}")
+
         stream = StreamDiffusionWrapper(
             model_id_or_path=model_path_dir,
             t_index_list=list(t_index_list),
@@ -1033,6 +1040,7 @@ def image_generation_process(
             cfg_type=cfg_type,
             seed=seed,
             lora_dict=lora_dict,
+            engine_dir=trt_engine_dir,
         )
         _status("StreamDiffusion model prepared")
 
@@ -2310,7 +2318,7 @@ class StreamGUI(ctk.CTk):
         if SHOW.get("acceleration", True):
             ctk.CTkLabel(g2, text="Acceleration").grid(row=0, column=col, sticky="w")
             self._w_accel_combo = ctk.CTkComboBox(
-                g2, values=["none","xformers"], variable=self.accel_var, width=120
+                g2, values=["none","xformers","tensorrt"], variable=self.accel_var, width=120
             )
             self._w_accel_combo.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_accel_combo)

@@ -621,12 +621,14 @@ class StreamDiffusionWrapper:
                 stream.pipe.enable_xformers_memory_efficient_attention()
             if acceleration == "tensorrt":
                 from polygraphy import cuda
+                from polygraphy.backend.trt import util as trt_util
                 from streamdiffusion.acceleration.tensorrt import (
                     TorchVAEEncoder,
                     compile_unet,
                     compile_vae_decoder,
                     compile_vae_encoder,
                 )
+                from streamdiffusion.acceleration.tensorrt import utilities as trt_utilities
                 from streamdiffusion.acceleration.tensorrt.engine import (
                     AutoencoderKLEngine,
                     UNet2DConditionModelEngine,
@@ -636,6 +638,45 @@ class StreamDiffusionWrapper:
                     UNet,
                     VAEEncoder,
                 )
+
+                # StreamDiffusion expects an older Polygraphy helper that may
+                # be absent in newer releases. Provide a local compatibility shim.
+                if not hasattr(trt_util, "get_bindings_per_profile"):
+                    def _get_bindings_per_profile(engine):
+                        if hasattr(engine, "num_io_tensors"):
+                            return int(engine.num_io_tensors)
+                        if hasattr(engine, "num_bindings"):
+                            profiles = int(getattr(engine, "num_optimization_profiles", 1) or 1)
+                            return int(engine.num_bindings // profiles)
+                        return 0
+                    trt_util.get_bindings_per_profile = _get_bindings_per_profile
+
+                # TensorRT 10 dropped legacy binding APIs that StreamDiffusion
+                # still calls. Patch allocate_buffers to support both APIs.
+                if not getattr(trt_utilities.Engine, "_sd_trt10_compat", False):
+                    _orig_allocate_buffers = trt_utilities.Engine.allocate_buffers
+
+                    def _allocate_buffers_compat(self, shape_dict=None, device="cuda"):
+                        if hasattr(self.engine, "num_io_tensors"):
+                            for idx in range(int(self.engine.num_io_tensors)):
+                                name = self.engine.get_tensor_name(idx)
+                                shape = shape_dict.get(name) if shape_dict and name in shape_dict else self.engine.get_tensor_shape(name)
+                                mode = self.engine.get_tensor_mode(name)
+                                if mode == trt_utilities.trt.TensorIOMode.INPUT:
+                                    self.context.set_input_shape(name, tuple(shape))
+                                dtype = trt_utilities.trt.nptype(self.engine.get_tensor_dtype(name))
+                                tensor = torch.empty(
+                                    tuple(shape),
+                                    dtype=trt_utilities.numpy_to_torch_dtype_dict[dtype],
+                                    device=device,
+                                )
+                                self.tensors[name] = tensor
+                            return
+
+                        return _orig_allocate_buffers(self, shape_dict=shape_dict, device=device)
+
+                    trt_utilities.Engine.allocate_buffers = _allocate_buffers_compat
+                    trt_utilities.Engine._sd_trt10_compat = True
 
                 def create_prefix(
                     model_id_or_path: str,
