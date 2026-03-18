@@ -1,0 +1,12 @@
+# Local runtime environment
+.venv/
+__pycache__/
+*.pyc
+
+# Local model and generated engine artifacts
+models/
+engines/
+
+# Local app/runtime temp files
+*.log
+*.tmp
