@@ -782,6 +782,7 @@ def _screen_capture_loop_dx(stop_evt: threading.Event,
 
     frame_count = 0
     last_log_time = time.time()
+    frame_api_mode = "auto"  # auto -> region_kw | grab_region | full_frame
 
     try:
         while not stop_evt.is_set():
@@ -790,7 +791,34 @@ def _screen_capture_loop_dx(stop_evt: threading.Event,
             W, H = int(rect["width"]), int(rect["height"])
             R, B = L + W, T + H
 
-            frame = camera.get_latest_frame(region=(L, T, R, B))
+            frame = None
+            if frame_api_mode in ("auto", "region_kw"):
+                try:
+                    frame = camera.get_latest_frame(region=(L, T, R, B))
+                    frame_api_mode = "region_kw"
+                except TypeError:
+                    frame_api_mode = "grab_region"
+                except Exception:
+                    frame_api_mode = "grab_region"
+
+            if frame is None and frame_api_mode in ("auto", "grab_region"):
+                try:
+                    frame = camera.grab(region=(L, T, R, B))
+                    frame_api_mode = "grab_region"
+                except Exception:
+                    frame_api_mode = "full_frame"
+
+            if frame is None:
+                frame = camera.get_latest_frame()
+                if frame is not None:
+                    # Some dxcam builds return full output frame and do not accept region input.
+                    h_full, w_full = int(frame.shape[0]), int(frame.shape[1])
+                    x0 = max(0, L)
+                    y0 = max(0, T)
+                    x1 = min(w_full, R)
+                    y1 = min(h_full, B)
+                    if (x1 > x0) and (y1 > y0):
+                        frame = frame[y0:y1, x0:x1]
             if frame is None:
                 time.sleep(0.001)
                 continue
@@ -1651,6 +1679,13 @@ class StreamGUI(ctk.CTk):
         self.out_q = self.fps_q = self.status_q = self.control_q = self.debug_q = self.close_q = None
         self.monitor_sender = self.monitor_receiver = None
         self.running = False
+        self.profiling_running = False
+        self._profiling_gpu_proc = None
+        self._profiling_proc_proc = None
+        self._profiling_gpu_log = None
+        self._profiling_proc_log = None
+        self._profiling_gpu_fh = None
+        self._profiling_proc_fh = None
 
         self.model_var = ctk.StringVar(value=LOCAL_MODEL_PATH)
         self.prompt_var = ctk.StringVar(value="flip book animation, black and white rough sketch, rough drawing")
@@ -2322,6 +2357,16 @@ class StreamGUI(ctk.CTk):
             )
             self._w_accel_combo.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_accel_combo)
+            ctk.CTkLabel(g2, text="Profiling").grid(row=0, column=col, sticky="w")
+            self.profile_btn = ctk.CTkButton(
+                g2,
+                text="Start Profiling",
+                command=self._toggle_profiling,
+                width=140,
+                fg_color=CUSTOM_COLORS["success"],
+                hover_color="#059669",
+            )
+            self.profile_btn.grid(row=1, column=col, sticky="ew"); col += 1
         if SHOW.get("use_denoising_batch", True):
             self._w_denoise_switch = ctk.CTkSwitch(g2, text="Denoising batch", variable=self.denoise_batch_var)
             self._w_denoise_switch.grid(row=1, column=col, sticky="w"); col += 1
@@ -2892,6 +2937,103 @@ class StreamGUI(ctk.CTk):
     def _on_capture_window_moved(self):
         if self.running: self._send_region_update()
 
+    def _refresh_profile_button(self):
+        if not hasattr(self, "profile_btn"):
+            return
+        if self.profiling_running:
+            self.profile_btn.configure(
+                text="Stop Profiling",
+                fg_color=CUSTOM_COLORS["error"],
+                hover_color="#DC2626",
+            )
+        else:
+            self.profile_btn.configure(
+                text="Start Profiling",
+                fg_color=CUSTOM_COLORS["success"],
+                hover_color="#059669",
+            )
+
+    def _toggle_profiling(self):
+        if self.profiling_running:
+            self._stop_profiling()
+        else:
+            self._start_profiling()
+
+    def _start_profiling(self):
+        smi_path = shutil.which("nvidia-smi")
+        if not smi_path:
+            messagebox.showerror("Profiling Error", "nvidia-smi not found in PATH.")
+            return
+
+        try:
+            profiling_dir = APP_ROOT / "profiling"
+            profiling_dir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self._profiling_gpu_log = str(profiling_dir / f"gpu_metrics_{ts}.csv")
+            self._profiling_proc_log = str(profiling_dir / f"gpu_processes_{ts}.csv")
+
+            self._profiling_gpu_fh = open(self._profiling_gpu_log, "w", buffering=1, encoding="utf-8")
+            self._profiling_proc_fh = open(self._profiling_proc_log, "w", buffering=1, encoding="utf-8")
+
+            self._profiling_gpu_proc = subprocess.Popen(
+                [
+                    smi_path,
+                    "--query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,temperature.gpu,clocks.sm,clocks.mem",
+                    "--format=csv",
+                    "-l",
+                    "1",
+                ],
+                stdout=self._profiling_gpu_fh,
+                stderr=subprocess.DEVNULL,
+            )
+            self._profiling_proc_proc = subprocess.Popen(
+                [
+                    smi_path,
+                    "--query-compute-apps=timestamp,pid,process_name,used_gpu_memory",
+                    "--format=csv",
+                    "-l",
+                    "1",
+                ],
+                stdout=self._profiling_proc_fh,
+                stderr=subprocess.DEVNULL,
+            )
+
+            self.profiling_running = True
+            self._refresh_profile_button()
+            self.status_var.set(f"Profiling started: {self._profiling_gpu_log}")
+        except Exception as e:
+            self._stop_profiling(silent=True)
+            messagebox.showerror("Profiling Error", f"Failed to start profiling: {e}")
+
+    def _stop_profiling(self, silent=False):
+        for proc in (self._profiling_gpu_proc, self._profiling_proc_proc):
+            if proc is None:
+                continue
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        self._profiling_gpu_proc = None
+        self._profiling_proc_proc = None
+        for fh_attr in ("_profiling_gpu_fh", "_profiling_proc_fh"):
+            fh = getattr(self, fh_attr, None)
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            setattr(self, fh_attr, None)
+        was_running = self.profiling_running
+        self.profiling_running = False
+        self._refresh_profile_button()
+        if (not silent) and was_running:
+            self.status_var.set(f"Profiling stopped. Logs saved in {APP_ROOT / 'profiling'}")
+
     def _poll_queues(self):
         if self.out_q is not None:
             try:
@@ -2931,6 +3073,7 @@ class StreamGUI(ctk.CTk):
         if not messagebox.askyesno("Quit", "Are you sure you want to quit and stop all workers?"):
             return
         if self.running: self._on_stop()
+        if self.profiling_running: self._stop_profiling(silent=True)
         self.destroy()
 
 # =========================
