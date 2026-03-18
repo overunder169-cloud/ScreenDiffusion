@@ -565,14 +565,31 @@ class StreamDiffusionWrapper:
             The loaded model.
         """
 
+        resolved_model_path = model_id_or_path
+        maybe_path = Path(model_id_or_path)
+        if maybe_path.is_dir() and not (maybe_path / "model_index.json").exists():
+            # If user points to TRT engine output, fall back to the base model folder.
+            # Example:
+            #   models/sd-turbo-trt/<engine_profile_dir>  -> models/sd-turbo
+            if maybe_path.name.endswith("-trt"):
+                candidate = maybe_path.parent / maybe_path.name[:-4]
+                if (candidate / "model_index.json").exists():
+                    resolved_model_path = str(candidate)
+            elif maybe_path.parent.name.endswith("-trt"):
+                candidate = maybe_path.parent.parent / maybe_path.parent.name[:-4]
+                if (candidate / "model_index.json").exists():
+                    resolved_model_path = str(candidate)
+            if resolved_model_path != model_id_or_path:
+                print(f"[Wrapper] Using base model folder: {resolved_model_path}")
+
         try:  # Load from local directory
             pipe: StableDiffusionPipeline = StableDiffusionPipeline.from_pretrained(
-                model_id_or_path,
+                resolved_model_path,
             ).to(device=self.device, dtype=self.dtype)
 
         except ValueError:  # Load from huggingface
             pipe: StableDiffusionPipeline = StableDiffusionPipeline.from_single_file(
-                model_id_or_path,
+                resolved_model_path,
             ).to(device=self.device, dtype=self.dtype)
         except Exception:  # No model found
             traceback.print_exc()
