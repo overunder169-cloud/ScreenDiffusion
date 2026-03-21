@@ -30,6 +30,7 @@ import queue
 import random
 import threading
 import pathlib
+import array
 
 import subprocess
 from collections import deque
@@ -75,6 +76,11 @@ CUSTOM_COLORS = {
     "surface": "#374151"
 }
 
+SPOUT_INSTALL_HINT = (
+    "Spout dependencies missing. Install with: "
+    ".\\.venv\\Scripts\\python.exe -m pip install SpoutGL==0.1.1 PyOpenGL==3.1.10"
+)
+
 GWL_EXSTYLE       = -20
 WS_EX_LAYERED     = 0x00080000
 WS_EX_TOOLWINDOW  = 0x00000080
@@ -82,6 +88,170 @@ GetWindowLongW    = _user32.GetWindowLongW
 SetWindowLongW    = _user32.SetWindowLongW
 SetLayeredWindowAttributes = _user32.SetLayeredWindowAttributes
 LWA_ALPHA         = 0x00000002
+
+
+def _check_spout_dependencies() -> tuple[bool, str]:
+    try:
+        import SpoutGL  # noqa: F401
+        from OpenGL import GL  # noqa: F401
+        return True, "Spout ready"
+    except Exception as e:
+        return False, f"{SPOUT_INSTALL_HINT} | Details: {e}"
+
+
+def _resize_fit_pad_rgba(frame: np.ndarray, target_w: int, target_h: int):
+    """Fit entire frame into target while preserving aspect ratio and padding."""
+    src_h, src_w = int(frame.shape[0]), int(frame.shape[1])
+    if src_w <= 0 or src_h <= 0:
+        blank = np.zeros((target_h, target_w, 4), dtype=np.uint8)
+        mask = np.zeros((target_h, target_w), dtype=np.float32)
+        return blank, mask, 1.0, 1.0
+
+    scale = min(target_w / src_w, target_h / src_h)
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+
+    if (new_w, new_h) != (src_w, src_h):
+        try:
+            import cv2
+            interp = cv2.INTER_AREA if (new_w < src_w or new_h < src_h) else cv2.INTER_LINEAR
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+        except Exception:
+            resized = np.array(
+                PIL.Image.fromarray(frame, "RGBA").resize((new_w, new_h), resample=PIL.Image.BILINEAR)
+            )
+    else:
+        resized = frame
+
+    out = np.zeros((target_h, target_w, 4), dtype=np.uint8)
+    mask = np.zeros((target_h, target_w), dtype=np.float32)
+    off_x = (target_w - new_w) // 2
+    off_y = (target_h - new_h) // 2
+    out[off_y:off_y + new_h, off_x:off_x + new_w] = resized
+    mask[off_y:off_y + new_h, off_x:off_x + new_w] = 1.0
+
+    # Compensation factors for motion vectors when sender size differs.
+    flow_scale_x = float(new_w) / float(src_w)
+    flow_scale_y = float(new_h) / float(src_h)
+    return out, mask, flow_scale_x, flow_scale_y
+
+
+def _packet_from_rgba(
+    rgba: np.ndarray,
+    target_w: int,
+    target_h: int,
+    torch_mod,
+    motion_rgba: Optional[np.ndarray] = None,
+):
+    rgba_fit, mask2d, flow_sx, flow_sy = _resize_fit_pad_rgba(rgba, target_w, target_h)
+    color = rgba_fit[..., :3].astype(np.float32) / 255.0
+    color_t = torch_mod.from_numpy(color).permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)
+
+    motion_t = None
+    if motion_rgba is not None:
+        motion_fit, _, _, _ = _resize_fit_pad_rgba(motion_rgba, target_w, target_h)
+        motion = motion_fit[..., :3].astype(np.float32) / 255.0
+        motion_t = torch_mod.from_numpy(motion).permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)
+
+    mask_t = torch_mod.from_numpy(mask2d.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    return {
+        "color": color_t,
+        "motion": motion_t,
+        "mask": mask_t,
+        "flow_scale_x": float(flow_sx),
+        "flow_scale_y": float(flow_sy),
+    }
+
+
+def _decode_motion_flow(
+    motion_rgb,
+    mask,
+    motion_scale: float,
+    invert_y: bool,
+    use_b_magnitude: bool,
+    b_scale: float,
+    flow_scale_x: float,
+    flow_scale_y: float,
+):
+    # motion_rgb is [N,3,H,W] in [0,1]
+    import torch
+
+    rg = motion_rgb[:, 0:2, :, :]
+    flow = (rg * 2.0 - 1.0) * float(motion_scale)
+    if invert_y:
+        flow[:, 1:2, :, :] *= -1.0
+    flow[:, 0:1, :, :] *= float(flow_scale_x)
+    flow[:, 1:2, :, :] *= float(flow_scale_y)
+
+    if use_b_magnitude:
+        b = motion_rgb[:, 2:3, :, :].clamp(0.0, 1.0)
+        mag = b * float(b_scale)
+        flow = flow * mag
+
+    # Guard against malformed input and keep warping numerically stable.
+    flow = torch.nan_to_num(flow, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Reduce tiny global bias drift (common with imperfect neutral encoding around 0.5).
+    if mask is not None:
+        valid = mask.clamp(0.0, 1.0)
+        denom = valid.sum(dim=(2, 3), keepdim=True).clamp(min=1.0)
+        mean_flow = (flow * valid).sum(dim=(2, 3), keepdim=True) / denom
+        flow = flow - mean_flow * (mean_flow.abs() < 0.75).to(flow.dtype)
+    else:
+        mean_flow = flow.mean(dim=(2, 3), keepdim=True)
+        flow = flow - mean_flow * (mean_flow.abs() < 0.75).to(flow.dtype)
+
+    # Soft deadzone removes sub-pixel jitter that accumulates into feedback artifacts.
+    deadzone_px = 0.10
+    mag = torch.sqrt((flow[:, 0:1, :, :] ** 2) + (flow[:, 1:2, :, :] ** 2))
+    shrink = (mag - deadzone_px).clamp(min=0.0) / (mag + 1e-6)
+    flow = flow * shrink
+
+    # Hard clamp max displacement per frame to avoid catastrophic warp blow-ups.
+    max_flow_px = 6.0
+    mag = torch.sqrt((flow[:, 0:1, :, :] ** 2) + (flow[:, 1:2, :, :] ** 2))
+    clamp_scale = (max_flow_px / (mag + 1e-6)).clamp(max=1.0)
+    flow = flow * clamp_scale
+
+    if mask is not None:
+        flow = flow * mask
+    return flow
+
+
+def _warp_prev_with_flow(prev_tensor, flow_pixels):
+    # prev_tensor: [N,3,H,W], flow_pixels: [N,2,H,W] in pixel units
+    import torch
+    n, _, h, w = prev_tensor.shape
+    device = prev_tensor.device
+    dtype = prev_tensor.dtype
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=device, dtype=dtype),
+        torch.arange(w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    base_x = xs.unsqueeze(0).expand(n, -1, -1)
+    base_y = ys.unsqueeze(0).expand(n, -1, -1)
+
+    # Backward warp: sample previous frame at (x - flow) to align with current frame.
+    sample_x = base_x - flow_pixels[:, 0, :, :]
+    sample_y = base_y - flow_pixels[:, 1, :, :]
+    if w > 1:
+        norm_x = (sample_x / (w - 1)) * 2.0 - 1.0
+    else:
+        norm_x = sample_x * 0.0
+    if h > 1:
+        norm_y = (sample_y / (h - 1)) * 2.0 - 1.0
+    else:
+        norm_y = sample_y * 0.0
+
+    grid = torch.stack((norm_x, norm_y), dim=-1)
+    return torch.nn.functional.grid_sample(
+        prev_tensor,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
 
 
 if getattr(sys, "frozen", False):
@@ -779,6 +949,7 @@ def _screen_capture_loop_dx(stop_evt: threading.Event,
 
     staging_cpu = None
     need_resize = None
+    screen_mask = None
 
     frame_count = 0
     last_log_time = time.time()
@@ -842,7 +1013,16 @@ def _screen_capture_loop_dx(stop_evt: threading.Event,
                     img, size=(H_t, W_t), mode="bilinear", align_corners=False
                 )
 
-            _append_shed(inputs_list, img, max_buffer)
+            if screen_mask is None:
+                screen_mask = torch.ones((1, 1, H_t, W_t), device=img.device, dtype=img.dtype)
+            packet = {
+                "color": img,
+                "motion": None,
+                "mask": screen_mask,
+                "flow_scale_x": 1.0,
+                "flow_scale_y": 1.0,
+            }
+            _append_shed(inputs_list, packet, max_buffer)
 
             frame_count += 1
             now = time.time()
@@ -896,9 +1076,136 @@ def _screen_capture_loop_mss(stop_evt: threading.Event,
 
             tensor = torch.from_numpy(frame.astype(np.float32) / 255.0)\
                          .permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)
-            inputs_list.append(tensor)
+            packet = {
+                "color": tensor,
+                "motion": None,
+                "mask": torch.ones((1, 1, height, width), dtype=tensor.dtype),
+                "flow_scale_x": 1.0,
+                "flow_scale_y": 1.0,
+            }
+            inputs_list.append(packet)
             if isinstance(inputs_list, list) and len(inputs_list) > max_buffer:
                 del inputs_list[:-max_buffer]
+
+
+def _spout_capture_loop(
+    stop_evt: threading.Event,
+    height: int,
+    width: int,
+    max_buffer: int,
+    inputs_list: List[Any],
+    capture_cfg_ref: Dict[str, Any],
+    status_cb=None,
+):
+    torch = PreloadedDependencies.get_torch()
+    if torch is None:
+        return
+
+    try:
+        import SpoutGL
+        from OpenGL import GL
+    except Exception as e:
+        if status_cb:
+            status_cb(f"Spout unavailable: {e}")
+        return
+
+    def _append_shed(q, item, maxlen):
+        try:
+            if hasattr(q, "maxlen") and q.maxlen is not None:
+                if len(q) >= q.maxlen:
+                    q.popleft()
+                q.append(item)
+            else:
+                while len(q) >= maxlen:
+                    q.pop(0)
+                q.append(item)
+        except Exception:
+            pass
+
+    color_buffer = None
+    motion_buffer = None
+    color_w = color_h = 0
+    motion_w = motion_h = 0
+    last_motion_ok = False
+    last_log = 0.0
+
+    with SpoutGL.SpoutReceiver() as color_rx, SpoutGL.SpoutReceiver() as motion_rx:
+        bound_color = None
+        bound_motion = None
+        while not stop_evt.is_set():
+            cfg = dict(capture_cfg_ref.get("cfg", {}))
+            color_name = str(cfg.get("spout_color_sender", "UE_Color"))
+            motion_name = str(cfg.get("spout_motion_sender", "UE_Motion"))
+
+            if color_name != bound_color:
+                color_rx.setReceiverName(color_name)
+                color_buffer = None
+                bound_color = color_name
+                if status_cb:
+                    status_cb(f"Spout color sender: {color_name}")
+            if motion_name != bound_motion:
+                motion_rx.setReceiverName(motion_name)
+                motion_buffer = None
+                bound_motion = motion_name
+                if status_cb:
+                    status_cb(f"Spout motion sender: {motion_name}")
+
+            try:
+                color_rx.waitFrameSync(color_name, 0)
+            except Exception:
+                pass
+
+            if color_buffer is None or color_rx.isUpdated():
+                color_w = max(1, int(color_rx.getSenderWidth() or width))
+                color_h = max(1, int(color_rx.getSenderHeight() or height))
+                color_buffer = array.array("B", [0] * (color_w * color_h * 4))
+
+            got_color = False
+            try:
+                got_color = bool(color_rx.receiveImage(color_buffer, GL.GL_RGBA, False, 0))
+            except Exception:
+                got_color = False
+            if not got_color:
+                time.sleep(0.002)
+                continue
+
+            color_rgba = np.asarray(color_buffer, dtype=np.uint8).reshape((color_h, color_w, 4)).copy()
+            color_rx.setFrameSync(color_name)
+
+            motion_rgba = None
+            try:
+                motion_rx.waitFrameSync(motion_name, 0)
+            except Exception:
+                pass
+            try:
+                if motion_buffer is None or motion_rx.isUpdated():
+                    motion_w = max(1, int(motion_rx.getSenderWidth() or width))
+                    motion_h = max(1, int(motion_rx.getSenderHeight() or height))
+                    motion_buffer = array.array("B", [0] * (motion_w * motion_h * 4))
+                got_motion = bool(motion_rx.receiveImage(motion_buffer, GL.GL_RGBA, False, 0))
+                if got_motion:
+                    motion_rgba = np.asarray(motion_buffer, dtype=np.uint8).reshape((motion_h, motion_w, 4)).copy()
+                    motion_rx.setFrameSync(motion_name)
+                    last_motion_ok = True
+                else:
+                    last_motion_ok = False
+            except Exception:
+                last_motion_ok = False
+
+            packet = _packet_from_rgba(
+                color_rgba,
+                width,
+                height,
+                torch,
+                motion_rgba=motion_rgba,
+            )
+            _append_shed(inputs_list, packet, max_buffer)
+
+            now = time.time()
+            if status_cb and (now - last_log > 5.0):
+                mm = "ok" if last_motion_ok else "missing->no warp"
+                status_cb(f"Spout running | color={color_name} | motion={motion_name} ({mm})")
+                last_log = now
 
 # =========================
 # Worker
@@ -943,6 +1250,7 @@ def image_generation_process(
     similar_image_filter_threshold: float,
     similar_image_filter_max_skip_frame: float,
     monitor_receiver: Connection,
+    capture_config: Optional[Dict[str, Any]] = None,
     offline: bool = True,
 ) -> None:
     
@@ -1016,6 +1324,21 @@ def image_generation_process(
         except Exception: 
             pass
 
+    cap_cfg = dict(capture_config or {})
+    capture_source = str(cap_cfg.get("capture_source", "screen")).lower()
+    spout_color_sender = str(cap_cfg.get("spout_color_sender", "UE_Color"))
+    spout_motion_sender = str(cap_cfg.get("spout_motion_sender", "UE_Motion"))
+    spout_output_enabled = bool(cap_cfg.get("spout_output_enabled", False))
+    spout_output_sender = str(cap_cfg.get("spout_output_sender", "SD_Output"))
+    spout_output_fps_cap = float(cap_cfg.get("spout_output_fps_cap", 30.0))
+    motion_warp_enabled = bool(cap_cfg.get("motion_warp_enabled", False))
+    motion_scale = float(cap_cfg.get("motion_scale", 1.0))
+    warp_strength = float(cap_cfg.get("warp_strength", 0.35))
+    motion_invert_y = bool(cap_cfg.get("motion_invert_y", True))
+    motion_use_b_magnitude = bool(cap_cfg.get("motion_use_b_magnitude", False))
+    motion_b_scale = float(cap_cfg.get("motion_b_scale", 1.0)
+                           if cap_cfg.get("motion_b_scale", 1.0) is not None else 1.0)
+
     try:
         _status("Worker process: initializing...")
     
@@ -1083,27 +1406,71 @@ def image_generation_process(
         )
         _status("Pipeline prepared successfully")
 
-        # Wait for initial region from GUI
-        _status("Waiting for capture region...")
-        first_rect = monitor_receiver.recv()
-        region_ref = {"rect": dict(first_rect)}
-        _status(f"Capture region received: {first_rect}")
+        region_ref = {"rect": {"left": 0, "top": 0, "width": width, "height": height}}
+        if capture_source == "screen":
+            _status("Waiting for capture region...")
+            first_rect = monitor_receiver.recv()
+            region_ref = {"rect": dict(first_rect)}
+            _status(f"Capture region received: {first_rect}")
+        else:
+            _status("Spout mode selected (no capture window region needed)")
 
         # Setup capture
         inputs = deque(maxlen=frame_buffer_size * 2)
         cap_stop = threading.Event()
-    
-        _status("Starting screen capture thread...")
-        cap_thr = threading.Thread(
-            target=_screen_capture_loop_dx,
-            args=(cap_stop, height, width, region_ref, frame_buffer_size, inputs),
-            daemon=True,
-        )
-        cap_thr.start()
-        _status("Screen capture started")
+        capture_cfg_ref = {
+            "cfg": {
+                "spout_color_sender": spout_color_sender,
+                "spout_motion_sender": spout_motion_sender,
+            }
+        }
+
+        if capture_source == "spout":
+            _status("Starting Spout capture thread...")
+            cap_thr = threading.Thread(
+                target=_spout_capture_loop,
+                args=(
+                    cap_stop,
+                    height,
+                    width,
+                    frame_buffer_size,
+                    inputs,
+                    capture_cfg_ref,
+                    _status,
+                ),
+                daemon=True,
+            )
+            cap_thr.start()
+            _status("Spout capture started")
+        else:
+            _status("Starting screen capture thread...")
+            cap_thr = threading.Thread(
+                target=_screen_capture_loop_dx,
+                args=(cap_stop, height, width, region_ref, frame_buffer_size, inputs),
+                daemon=True,
+            )
+            cap_thr.start()
+            _status("Screen capture started")
+
+        spout_sender = None
+        spout_gl = None
+        spout_sender_name = spout_output_sender
+        spout_out_last_ts = 0.0
+        if spout_output_enabled:
+            try:
+                import SpoutGL
+                from OpenGL import GL
+                spout_gl = GL
+                spout_sender = SpoutGL.SpoutSender()
+                spout_sender.setSenderName(spout_sender_name)
+                _status(f"Spout output enabled: {spout_sender_name}")
+            except Exception as e:
+                spout_sender = None
+                _status(f"Spout output unavailable: {e}")
     
         current_t_index_list = list(t_index_list)
         frame_count = 0
+        prev_output_tensor = None
         _status("Entering main processing loop...")
 
         # Main processing loop
@@ -1117,7 +1484,7 @@ def image_generation_process(
                     
                     mtype = msg.get("type")
 
-                    if mtype == "set_region":
+                    if mtype == "set_region" and capture_source == "screen":
                         r = msg.get("region")
                         if isinstance(r, dict) and all(k in r for k in ("left","top","width","height")):
                             region_ref["rect"] = {k:int(r[k]) for k in ("left","top","width","height")}
@@ -1176,6 +1543,73 @@ def image_generation_process(
                             # CRITICAL: Restore the t_index_list after prepare
                             stream.set_t_index_list(current_t_index_list)
                             _status("Pipeline re-prepared with new negative prompt (t_list restored)")
+
+                    elif mtype == "set_advanced":
+                        cfg = msg.get("cfg")
+                        if isinstance(cfg, dict):
+                            prev_motion_warp_enabled = bool(motion_warp_enabled)
+                            new_capture_source = str(cfg.get("capture_source", capture_source)).lower()
+                            if new_capture_source != capture_source:
+                                _status("Capture source change requires restart")
+
+                            spout_color_sender = str(cfg.get("spout_color_sender", spout_color_sender))
+                            spout_motion_sender = str(cfg.get("spout_motion_sender", spout_motion_sender))
+                            capture_cfg_ref["cfg"]["spout_color_sender"] = spout_color_sender
+                            capture_cfg_ref["cfg"]["spout_motion_sender"] = spout_motion_sender
+
+                            spout_output_enabled = bool(cfg.get("spout_output_enabled", spout_output_enabled))
+                            spout_output_sender = str(cfg.get("spout_output_sender", spout_output_sender))
+                            try:
+                                spout_output_fps_cap = max(1.0, float(cfg.get("spout_output_fps_cap", spout_output_fps_cap)))
+                            except Exception:
+                                pass
+
+                            motion_warp_enabled = bool(cfg.get("motion_warp_enabled", motion_warp_enabled))
+                            if motion_warp_enabled != prev_motion_warp_enabled:
+                                prev_output_tensor = None
+                                _status("Motion warp state changed; history reset")
+                            try:
+                                motion_scale = float(cfg.get("motion_scale", motion_scale))
+                                warp_strength = max(0.0, min(1.0, float(cfg.get("warp_strength", warp_strength))))
+                                motion_b_scale = float(cfg.get("motion_b_scale", motion_b_scale))
+                            except Exception:
+                                pass
+                            motion_invert_y = bool(cfg.get("motion_invert_y", motion_invert_y))
+                            motion_use_b_magnitude = bool(cfg.get("motion_use_b_magnitude", motion_use_b_magnitude))
+
+                            if spout_output_enabled and spout_sender is None:
+                                try:
+                                    import SpoutGL
+                                    from OpenGL import GL
+                                    spout_gl = GL
+                                    spout_sender = SpoutGL.SpoutSender()
+                                    spout_sender_name = spout_output_sender
+                                    spout_sender.setSenderName(spout_sender_name)
+                                    _status(f"Spout output enabled: {spout_sender_name}")
+                                except Exception as e:
+                                    _status(f"Spout output unavailable: {e}")
+                            elif (not spout_output_enabled) and spout_sender is not None:
+                                try:
+                                    spout_sender.releaseSender()
+                                except Exception:
+                                    pass
+                                spout_sender = None
+                                _status("Spout output disabled")
+
+                            if spout_sender is not None and spout_output_sender != spout_sender_name:
+                                try:
+                                    spout_sender.releaseSender()
+                                except Exception:
+                                    pass
+                                try:
+                                    import SpoutGL
+                                    spout_sender = SpoutGL.SpoutSender()
+                                    spout_sender_name = spout_output_sender
+                                    spout_sender.setSenderName(spout_sender_name)
+                                    _status(f"Spout output sender -> {spout_sender_name}")
+                                except Exception as e:
+                                    spout_sender = None
+                                    _status(f"Spout sender update failed: {e}")
                             
             except Exception:
                 pass
@@ -1187,15 +1621,25 @@ def image_generation_process(
 
             try:
                 t0 = time.time()
+                packet = inputs[-1]
+                if not isinstance(packet, dict):
+                    packet = {
+                        "color": packet,
+                        "motion": None,
+                        "mask": None,
+                        "flow_scale_x": 1.0,
+                        "flow_scale_y": 1.0,
+                    }
 
                 # Prepare batch tensor
                 if frame_buffer_size == 1:
-                    batch = inputs[-1]
+                    batch = packet.get("color")
                 else:
                     sampled = []
                     for i in range(frame_buffer_size):
                         idx = max(0, len(inputs) - frame_buffer_size + i)
-                        sampled.append(inputs[idx])
+                        p = inputs[idx]
+                        sampled.append(p.get("color") if isinstance(p, dict) else p)
                     batch = import_torch.cat(sampled)
 
                 # Clean up old frames if using list
@@ -1205,6 +1649,80 @@ def image_generation_process(
                 # Ensure tensor is on correct device/dtype
                 if isinstance(batch, import_torch.Tensor):
                     batch = batch.to(device=stream.device, dtype=stream.dtype)
+
+                # Motion-vector warp guidance (single-frame path)
+                if (
+                    motion_warp_enabled
+                    and frame_buffer_size == 1
+                    and prev_output_tensor is not None
+                    and isinstance(packet.get("motion"), import_torch.Tensor)
+                ):
+                    try:
+                        prev_mean = float(prev_output_tensor.mean().item())
+                    except Exception:
+                        prev_mean = 0.0
+                    if (not np.isfinite(prev_mean)) or prev_mean < 0.01:
+                        prev_output_tensor = None
+                    if prev_output_tensor is not None:
+                        motion_t = packet["motion"].to(device=stream.device, dtype=stream.dtype)
+                        mask_t = packet.get("mask")
+                        if isinstance(mask_t, import_torch.Tensor):
+                            mask_t = mask_t.to(device=stream.device, dtype=stream.dtype)
+                        flow = _decode_motion_flow(
+                            motion_rgb=motion_t,
+                            mask=mask_t,
+                            motion_scale=motion_scale,
+                            invert_y=motion_invert_y,
+                            use_b_magnitude=motion_use_b_magnitude,
+                            b_scale=motion_b_scale,
+                            flow_scale_x=float(packet.get("flow_scale_x", 1.0)),
+                            flow_scale_y=float(packet.get("flow_scale_y", 1.0)),
+                        )
+                        warped_prev = _warp_prev_with_flow(prev_output_tensor, flow).clamp(0.0, 1.0)
+                        s = max(0.0, min(1.0, float(warp_strength)))
+                        # Back off warp blending automatically when flow is unusually large.
+                        flow_mag = None
+                        try:
+                            flow_mag = import_torch.sqrt((flow[:, 0:1, :, :] ** 2) + (flow[:, 1:2, :, :] ** 2))
+                            flow_med = float(flow_mag.median().item())
+                            if np.isfinite(flow_med):
+                                if flow_med > 20.0:
+                                    s = 0.0
+                                elif flow_med > 4.0:
+                                    s *= max(0.2, min(1.0, 4.0 / (flow_med + 1e-6)))
+                        except Exception:
+                            pass
+                        # Only blend warped history where motion magnitude is meaningful.
+                        if s > 0.0 and isinstance(flow_mag, import_torch.Tensor):
+                            motion_floor_px = 0.35
+                            motion_span_px = 1.25
+                            blend_map = ((flow_mag - motion_floor_px) / motion_span_px).clamp(0.0, 1.0)
+                            if isinstance(mask_t, import_torch.Tensor):
+                                blend_map = blend_map * mask_t.clamp(0.0, 1.0)
+                            try:
+                                bm_mean = float(blend_map.mean().item())
+                                if np.isfinite(bm_mean) and bm_mean > 0.65:
+                                    s *= max(0.15, min(1.0, 0.65 / (bm_mean + 1e-6)))
+                            except Exception:
+                                pass
+                            # Never let motion-warp dominate the full frame.
+                            s = min(s, 0.35)
+                            blend = (blend_map * s).clamp(0.0, 0.35)
+                            # Safety: if blending would affect almost everything, back off hard.
+                            try:
+                                cover = float((blend > 0.01).float().mean().item())
+                                if np.isfinite(cover) and cover > 0.80:
+                                    blend = blend * 0.20
+                            except Exception:
+                                pass
+                            candidate = (batch * (1.0 - blend) + warped_prev * blend).clamp(0.0, 1.0)
+                            try:
+                                in_mean = float(batch.mean().item())
+                                cand_mean = float(candidate.mean().item())
+                                if np.isfinite(in_mean) and np.isfinite(cand_mean) and in_mean > 0.02 and cand_mean > (in_mean * 0.25):
+                                    batch = candidate
+                            except Exception:
+                                batch = candidate
 
                 # Run through stream diffusion - wrapper handles everything
                 res = stream.img2img(batch)
@@ -1223,6 +1741,36 @@ def image_generation_process(
                         frame_count += 1
                     except queue.Full: 
                         pass
+
+                    # Optional Spout output publishing (rate-capped)
+                    if spout_sender is not None and spout_output_enabled:
+                        now = time.time()
+                        interval = 1.0 / max(1.0, float(spout_output_fps_cap))
+                        if now - spout_out_last_ts >= interval:
+                            try:
+                                rgba = np.array(im.convert("RGBA"), dtype=np.uint8)
+                                h_o, w_o = rgba.shape[:2]
+                                spout_sender.sendImage(
+                                    np.ascontiguousarray(rgba),
+                                    w_o,
+                                    h_o,
+                                    spout_gl.GL_RGBA,
+                                    False,
+                                    0,
+                                )
+                                spout_sender.setFrameSync(spout_sender_name)
+                                spout_out_last_ts = now
+                            except Exception as e:
+                                _status(f"Spout output send error: {e}")
+
+                # Keep latest output tensor for next motion-warp step
+                if images:
+                    try:
+                        out_np = np.array(images[-1].convert("RGB"), dtype=np.float32) / 255.0
+                        prev_output_tensor = import_torch.from_numpy(out_np).permute(2, 0, 1).unsqueeze(0)
+                        prev_output_tensor = prev_output_tensor.to(device=stream.device, dtype=stream.dtype)
+                    except Exception:
+                        prev_output_tensor = None
 
                 # Calculate and send FPS
                 elapsed = time.time() - t0
@@ -1243,6 +1791,11 @@ def image_generation_process(
         _status("Stopping capture...")
         cap_stop.set()
         cap_thr.join(timeout=2.0)
+        if spout_sender is not None:
+            try:
+                spout_sender.releaseSender()
+            except Exception:
+                pass
         _status("Worker process finished")
 
     except KeyboardInterrupt:
@@ -1703,8 +2256,22 @@ class StreamGUI(ctk.CTk):
         self.sim_thresh_var = ctk.StringVar(value="0.99")
         self.sim_maxskip_var = ctk.StringVar(value="10.0")
         self.offline_var = ctk.BooleanVar(value=True)
+        self.capture_source_var = ctk.StringVar(value="screen")
+        self.spout_color_sender_var = ctk.StringVar(value="UE_Color")
+        self.spout_motion_sender_var = ctk.StringVar(value="UE_Motion")
+        self.spout_output_enabled_var = ctk.BooleanVar(value=False)
+        self.spout_output_sender_var = ctk.StringVar(value="SD_Output")
+        self.spout_output_fps_var = ctk.StringVar(value="30")
+        self.motion_warp_enabled_var = ctk.BooleanVar(value=False)
+        self.motion_scale_var = ctk.StringVar(value="1.0")
+        self.warp_strength_var = ctk.StringVar(value="0.35")
+        self.motion_invert_y_var = ctk.BooleanVar(value=True)
+        self.motion_use_b_magnitude_var = ctk.BooleanVar(value=False)
+        self.motion_b_scale_var = ctk.StringVar(value="1.0")
+        self.advanced_expanded_var = ctk.BooleanVar(value=False)
+        self.spout_ready, self.spout_status = _check_spout_dependencies()
         
-        self._debounce_prompt = self._debounce_neg = self._debounce_region = None
+        self._debounce_prompt = self._debounce_neg = self._debounce_region = self._debounce_advanced = None
 
         self.t_index_list: List[int] = [30]
         self._lockables: List[ctk.CTkBaseClass] = []
@@ -1768,6 +2335,104 @@ class StreamGUI(ctk.CTk):
             print(f"Failed to set window icon: {e}")
         return False
 
+    def _current_advanced_cfg(self) -> Dict[str, Any]:
+        def _f(var, default):
+            try:
+                return float(var.get().strip())
+            except Exception:
+                return float(default)
+
+        return {
+            "capture_source": str(self.capture_source_var.get()).lower(),
+            "spout_color_sender": self.spout_color_sender_var.get().strip() or "UE_Color",
+            "spout_motion_sender": self.spout_motion_sender_var.get().strip() or "UE_Motion",
+            "spout_output_enabled": bool(self.spout_output_enabled_var.get()),
+            "spout_output_sender": self.spout_output_sender_var.get().strip() or "SD_Output",
+            "spout_output_fps_cap": max(1.0, _f(self.spout_output_fps_var, 30.0)),
+            "motion_warp_enabled": bool(self.motion_warp_enabled_var.get()),
+            "motion_scale": _f(self.motion_scale_var, 1.0),
+            "warp_strength": max(0.0, min(1.0, _f(self.warp_strength_var, 0.35))),
+            "motion_invert_y": bool(self.motion_invert_y_var.get()),
+            "motion_use_b_magnitude": bool(self.motion_use_b_magnitude_var.get()),
+            "motion_b_scale": _f(self.motion_b_scale_var, 1.0),
+        }
+
+    def _toggle_advanced_panel(self):
+        self.advanced_expanded_var.set(not bool(self.advanced_expanded_var.get()))
+        self._refresh_advanced_visibility()
+
+    def _refresh_advanced_visibility(self):
+        if not hasattr(self, "advanced_body") or not hasattr(self, "advanced_toggle_btn"):
+            return
+        expanded = bool(self.advanced_expanded_var.get())
+        self.advanced_toggle_btn.configure(text=("Advanced ▾" if expanded else "Advanced ▸"))
+        if expanded:
+            self.advanced_body.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        else:
+            self.advanced_body.grid_forget()
+        self._refresh_spout_ui()
+
+    def _refresh_spout_ui(self):
+        has_spout_controls = hasattr(self, "_w_capture_source")
+        if not has_spout_controls:
+            return
+        use_spout = (self.capture_source_var.get().lower() == "spout")
+
+        spout_widgets = [
+            getattr(self, "_w_spout_color_entry", None),
+            getattr(self, "_w_spout_motion_entry", None),
+            getattr(self, "_w_spout_output_switch", None),
+            getattr(self, "_w_spout_output_sender_entry", None),
+            getattr(self, "_w_spout_out_fps_entry", None),
+            getattr(self, "_w_motion_warp_switch", None),
+            getattr(self, "_w_motion_scale_entry", None),
+            getattr(self, "_w_warp_strength_entry", None),
+            getattr(self, "_w_motion_invert_y_switch", None),
+            getattr(self, "_w_motion_use_b_switch", None),
+            getattr(self, "_w_motion_b_scale_entry", None),
+        ]
+
+        if (not self.spout_ready) and use_spout:
+            self.status_var.set(self.spout_status)
+
+        # Keep advanced Spout controls editable; we validate readiness on Start.
+        # This avoids "locking" the section when variable traces refresh widget states.
+        for w in spout_widgets:
+            if w is None:
+                continue
+            try:
+                w.configure(state="normal")
+            except Exception:
+                pass
+        # B-scale only editable when B modulation is enabled.
+        if getattr(self, "_w_motion_b_scale_entry", None) is not None:
+            try:
+                b_ok = bool(self.motion_use_b_magnitude_var.get())
+                self._w_motion_b_scale_entry.configure(state=("normal" if b_ok else "disabled"))
+            except Exception:
+                pass
+
+    def _on_advanced_control_changed(self, *_args):
+        self._refresh_spout_ui()
+        if self.running and getattr(self, "control_q", None):
+            if self._debounce_advanced is not None:
+                try:
+                    self.after_cancel(self._debounce_advanced)
+                except Exception:
+                    pass
+            self._debounce_advanced = self.after(120, self._push_advanced_runtime)
+
+    def _push_advanced_runtime(self):
+        if not getattr(self, "control_q", None):
+            return
+        try:
+            cfg = self._current_advanced_cfg()
+            if cfg.get("capture_source") != self.capture_source_var.get().lower():
+                cfg["capture_source"] = self.capture_source_var.get().lower()
+            self.control_q.put_nowait({"type": "set_advanced", "cfg": cfg})
+        except Exception:
+            pass
+
     def _setup_input_validation(self):
         """Set up validation for numeric entry fields"""
         def validate_numeric_input(P):
@@ -1786,7 +2451,13 @@ class StreamGUI(ctk.CTk):
             self._w_guidance_entry,
             self._w_delta_entry,
             self._w_sim_thresh,
-            self._w_sim_maxskip
+            self._w_sim_maxskip,
+            getattr(self, "_w_width_entry", None),
+            getattr(self, "_w_height_entry", None),
+            getattr(self, "_w_spout_out_fps_entry", None),
+            getattr(self, "_w_motion_scale_entry", None),
+            getattr(self, "_w_warp_strength_entry", None),
+            getattr(self, "_w_motion_b_scale_entry", None),
         ]
     
         for entry in numeric_entries:
@@ -2421,6 +3092,121 @@ class StreamGUI(ctk.CTk):
             self._register_lockables(self._w_sim_switch, self._w_sim_thresh, self._w_sim_maxskip)
             row += 1
 
+        # Advanced (collapsible): Spout + motion warp controls
+        adv_wrap = ctk.CTkFrame(left)
+        adv_wrap.grid(row=row, column=0, sticky="ew", pady=(4, 6))
+        adv_wrap.grid_columnconfigure(0, weight=1)
+
+        self.advanced_toggle_btn = ctk.CTkButton(
+            adv_wrap,
+            text="Advanced ▸",
+            command=self._toggle_advanced_panel,
+            height=30,
+            fg_color="#4B5563",
+            hover_color="#374151",
+        )
+        self.advanced_toggle_btn.grid(row=0, column=0, sticky="ew")
+
+        self.advanced_body = ctk.CTkFrame(adv_wrap)
+        self.advanced_body.grid_columnconfigure(1, weight=1)
+
+        r_adv = 0
+        ctk.CTkLabel(self.advanced_body, text="Capture Source").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=(6, 2))
+        self._w_capture_source = ctk.CTkComboBox(
+            self.advanced_body,
+            values=["screen", "spout"],
+            variable=self.capture_source_var,
+            width=140,
+        )
+        self._w_capture_source.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=(6, 2))
+        self._register_lockables(self._w_capture_source)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="Model Width").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=2)
+        self._w_width_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.width_var, width=100)
+        self._w_width_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=2)
+        self._register_lockables(self._w_width_entry)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="Model Height").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=2)
+        self._w_height_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.height_var, width=100)
+        self._w_height_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=2)
+        self._register_lockables(self._w_height_entry)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="Spout Color Sender").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=2)
+        self._w_spout_color_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.spout_color_sender_var)
+        self._w_spout_color_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=2)
+        self._register_lockables(self._w_spout_color_entry)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="Spout Motion Sender").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=2)
+        self._w_spout_motion_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.spout_motion_sender_var)
+        self._w_spout_motion_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=2)
+        self._register_lockables(self._w_spout_motion_entry)
+        r_adv += 1
+
+        self._w_spout_output_switch = ctk.CTkSwitch(self.advanced_body, text="Enable Spout Output", variable=self.spout_output_enabled_var)
+        self._w_spout_output_switch.grid(row=r_adv, column=0, columnspan=2, sticky="w", padx=(6, 6), pady=2)
+        self._register_lockables(self._w_spout_output_switch)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="Spout Output Sender").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=2)
+        self._w_spout_output_sender_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.spout_output_sender_var)
+        self._w_spout_output_sender_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=2)
+        self._register_lockables(self._w_spout_output_sender_entry)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="Spout Output FPS").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=2)
+        self._w_spout_out_fps_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.spout_output_fps_var, width=100)
+        self._w_spout_out_fps_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=2)
+        self._register_lockables(self._w_spout_out_fps_entry)
+        r_adv += 1
+
+        self._w_motion_warp_switch = ctk.CTkSwitch(self.advanced_body, text="Enable Motion Warp", variable=self.motion_warp_enabled_var)
+        self._w_motion_warp_switch.grid(row=r_adv, column=0, columnspan=2, sticky="w", padx=(6, 6), pady=2)
+        self._register_lockables(self._w_motion_warp_switch)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="Motion Scale").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=2)
+        self._w_motion_scale_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.motion_scale_var, width=100)
+        self._w_motion_scale_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=2)
+        self._register_lockables(self._w_motion_scale_entry)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="Warp Strength").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=2)
+        self._w_warp_strength_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.warp_strength_var, width=100)
+        self._w_warp_strength_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=2)
+        self._register_lockables(self._w_warp_strength_entry)
+        r_adv += 1
+
+        self._w_motion_invert_y_switch = ctk.CTkSwitch(self.advanced_body, text="Invert Motion Y", variable=self.motion_invert_y_var)
+        self._w_motion_invert_y_switch.grid(row=r_adv, column=0, columnspan=2, sticky="w", padx=(6, 6), pady=2)
+        self._register_lockables(self._w_motion_invert_y_switch)
+        r_adv += 1
+
+        self._w_motion_use_b_switch = ctk.CTkSwitch(self.advanced_body, text="Use B as Magnitude", variable=self.motion_use_b_magnitude_var)
+        self._w_motion_use_b_switch.grid(row=r_adv, column=0, columnspan=2, sticky="w", padx=(6, 6), pady=2)
+        self._register_lockables(self._w_motion_use_b_switch)
+        r_adv += 1
+
+        ctk.CTkLabel(self.advanced_body, text="B Magnitude Scale").grid(row=r_adv, column=0, sticky="w", padx=(6, 6), pady=(2, 6))
+        self._w_motion_b_scale_entry = ctk.CTkEntry(self.advanced_body, textvariable=self.motion_b_scale_var, width=100)
+        self._w_motion_b_scale_entry.grid(row=r_adv, column=1, sticky="ew", padx=(0, 6), pady=(2, 6))
+        self._register_lockables(self._w_motion_b_scale_entry)
+        r_adv += 1
+
+        self._w_spout_status_lbl = ctk.CTkLabel(
+            self.advanced_body,
+            text=("Spout ready" if self.spout_ready else self.spout_status),
+            text_color=("gray70" if self.spout_ready else "#FCA5A5"),
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        )
+        self._w_spout_status_lbl.grid(row=r_adv, column=0, columnspan=2, sticky="ew", padx=(6, 6), pady=(0, 6))
+        row += 1
+
         # GPU Add-On
         self.gpu_frame = ctk.CTkFrame(left)
         self.gpu_frame.grid(row=row, column=0, sticky="ew", pady=(6,6))
@@ -2553,6 +3339,27 @@ class StreamGUI(ctk.CTk):
         ctk.CTkLabel(status, textvariable=self.fps_var).grid(row=0, column=0, sticky="w", padx=12)
         ctk.CTkLabel(status, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=12)
         self.status_bar = status
+        for var in (
+            self.capture_source_var,
+            self.spout_color_sender_var,
+            self.spout_motion_sender_var,
+            self.spout_output_enabled_var,
+            self.spout_output_sender_var,
+            self.spout_output_fps_var,
+            self.motion_warp_enabled_var,
+            self.motion_scale_var,
+            self.warp_strength_var,
+            self.motion_invert_y_var,
+            self.motion_use_b_magnitude_var,
+            self.motion_b_scale_var,
+            self.width_var,
+            self.height_var,
+        ):
+            try:
+                var.trace_add("write", self._on_advanced_control_changed)
+            except Exception:
+                pass
+        self._refresh_advanced_visibility()
     def _validate_numeric_parameters(self):
         """Validate all numeric parameters before starting"""
         try:
@@ -2616,6 +3423,28 @@ class StreamGUI(ctk.CTk):
                     sim_maxskip = 10.0
             self.sim_maxskip_var.set(str(sim_maxskip))
 
+            w = int(self.width_var.get())
+            h = int(self.height_var.get())
+            if w < 64:
+                w = 64
+            if h < 64:
+                h = 64
+            self.width_var.set(w)
+            self.height_var.set(h)
+
+            spout_out_fps = float(self.spout_output_fps_var.get().strip() or "30")
+            self.spout_output_fps_var.set(str(max(1.0, spout_out_fps)))
+
+            motion_scale = float(self.motion_scale_var.get().strip() or "1.0")
+            self.motion_scale_var.set(str(motion_scale))
+
+            warp_strength = float(self.warp_strength_var.get().strip() or "0.35")
+            warp_strength = max(0.0, min(1.0, warp_strength))
+            self.warp_strength_var.set(str(warp_strength))
+
+            b_scale = float(self.motion_b_scale_var.get().strip() or "1.0")
+            self.motion_b_scale_var.set(str(b_scale))
+
             return True
 
         except ValueError as e:
@@ -2641,6 +3470,23 @@ class StreamGUI(ctk.CTk):
             for s in self._step_sliders:
                 try: s.configure(state="normal")
                 except Exception: pass
+            # Keep advanced tuning controls live while running.
+            runtime_widgets = [
+                getattr(self, "_w_capture_source", None),
+                getattr(self, "_w_spout_color_entry", None),
+                getattr(self, "_w_spout_motion_entry", None),
+                getattr(self, "_w_spout_output_switch", None),
+                getattr(self, "_w_spout_output_sender_entry", None),
+                getattr(self, "_w_spout_out_fps_entry", None),
+                getattr(self, "_w_motion_warp_switch", None),
+                getattr(self, "_w_motion_scale_entry", None),
+                getattr(self, "_w_warp_strength_entry", None),
+                getattr(self, "_w_motion_invert_y_switch", None),
+                getattr(self, "_w_motion_use_b_switch", None),
+                getattr(self, "_w_motion_b_scale_entry", None),
+            ]
+            self._set_state(runtime_widgets, "normal")
+            self._refresh_spout_ui()
         else:
             self._set_state(self._lockables, "normal")
 
@@ -2731,6 +3577,8 @@ class StreamGUI(ctk.CTk):
         return {"left": x, "top": y, "width": self.preview_dim, "height": self.preview_dim}
 
     def _send_region_update(self):
+        if self.capture_source_var.get().lower() != "screen":
+            return
         if self.running and getattr(self, "control_q", None):
             try:
                 self.control_q.put_nowait({"type": "set_region", "region": self._overlay_screen_rect()})
@@ -2864,6 +3712,10 @@ class StreamGUI(ctk.CTk):
         if not self._validate_numeric_parameters():
             return
 
+        if self.capture_source_var.get().lower() == "spout" and not self.spout_ready:
+            messagebox.showerror("Spout unavailable", self.spout_status)
+            return
+
         try:
             verify_local_model_path_dir(self.model_var.get())
         except Exception as e:
@@ -2876,6 +3728,7 @@ class StreamGUI(ctk.CTk):
         self.monitor_sender, self.monitor_receiver = ctx.Pipe()
 
         controlnet_paths: List[str] = []; controlnet_scales: List[float] = []
+        capture_cfg = self._current_advanced_cfg()
 
         self.proc_worker = ctx.Process(
             target=image_generation_process,
@@ -2892,20 +3745,28 @@ class StreamGUI(ctk.CTk):
                 float(self.guidance_var.get()), float(self.delta_var.get()),
                 False, bool(self.sim_filter_var.get()),
                 float(self.sim_thresh_var.get()), float(self.sim_maxskip_var.get()),
-                self.monitor_receiver, bool(self.offline_var.get()),
+                self.monitor_receiver, capture_cfg, bool(self.offline_var.get()),
             ),
         )
         self.proc_worker.start()
 
-        self.capwin = FloatingCaptureWindow(self, inner_size=self.preview_dim, border_px=8, handle_h=28)
-        try:
-            self.monitor_sender.send(self._overlay_screen_rect())
-        except Exception as e:
-            print(f"[gui] failed to send capture rect: {e}")
+        if self.capture_source_var.get().lower() == "screen":
+            self.capwin = FloatingCaptureWindow(self, inner_size=self.preview_dim, border_px=8, handle_h=28)
+            try:
+                self.monitor_sender.send(self._overlay_screen_rect())
+            except Exception as e:
+                print(f"[gui] failed to send capture rect: {e}")
+            self.hide_capture_btn.configure(state="normal")
+        else:
+            self.capwin = None
+            self.hide_capture_btn.configure(state="disabled")
+            try:
+                self.monitor_sender.send({"left": 0, "top": 0, "width": int(self.width_var.get()), "height": int(self.height_var.get())})
+            except Exception:
+                pass
 
         self.running = True
         self.start_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
-        self.hide_capture_btn.configure(state="normal")
         self._apply_running_state()
 
     def _on_stop(self):
